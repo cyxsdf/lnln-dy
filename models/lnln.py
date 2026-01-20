@@ -2,7 +2,8 @@ import torch
 from torch import nn
 from .basic_layers import Transformer, CrossTransformer, HhyperLearningEncoder, GradientReversalLayer
 from .bert import BertTextEncoder
-from .noise_adaptive_suppression import MultiModalNoiseSuppression  # 新增导入
+from .noise_adaptive_suppression import MultiModalNoiseSuppression  # 噪声抑制模块
+from .dynamic_cross_attention import DynamicCrossAttention  # 动态跨模态交互模块
 from einops import rearrange, repeat
 
 
@@ -48,7 +49,7 @@ class LNLN(nn.Module):
                         mlp_dim=args['model']['feature_extractor']['hidden_dims'][1])
         )
         
-        # 新增：噪声自适应抑制模块
+        # 噪声自适应抑制模块
         self.nas = MultiModalNoiseSuppression(args)
         
         self.proxy_dominate_modality_generator = Transformer(
@@ -86,7 +87,6 @@ class LNLN(nn.Module):
                 nn.Sigmoid()),
         ])
 
-
         self.reconstructor = nn.ModuleList([
             Transformer(num_frames=args['model']['reconstructor']['input_length'], 
                         save_hidden=False, 
@@ -97,7 +97,7 @@ class LNLN(nn.Module):
                         mlp_dim=args['model']['reconstructor']['hidden_dim']) for _ in range(3)
         ])
 
-
+        # 核心修改：替换CrossTransformer为DynamicCrossAttention
         self.dmml = nn.ModuleList([
             Transformer(num_frames=args['model']['dmml']['language_encoder']['input_length'], 
                         save_hidden=True, 
@@ -112,17 +112,11 @@ class LNLN(nn.Module):
                                   depth=args['model']['dmml']['hyper_modality_learning']['depth'], 
                                   heads=args['model']['dmml']['hyper_modality_learning']['heads']),
 
-            CrossTransformer(source_num_frames=args['model']['dmml']['fuison_transformer']['source_length'], 
-                             tgt_num_frames=args['model']['dmml']['fuison_transformer']['tgt_length'], 
-                             dim=args['model']['dmml']['fuison_transformer']['input_dim'], 
-                             depth=args['model']['dmml']['fuison_transformer']['depth'], 
-                             heads=args['model']['dmml']['fuison_transformer']['heads'], 
-                             mlp_dim=args['model']['dmml']['fuison_transformer']['hidden_dim']),
+            # 动态跨模态交互模块（替换原CrossTransformer）
+            DynamicCrossAttention(args),
 
             nn.Linear(args['model']['dmml']['regression']['input_dim'], args['model']['dmml']['regression']['out_dim'])
         ])
-
-
 
     def forward(self, complete_input, incomplete_input):
         vision, audio, language = complete_input
@@ -135,7 +129,7 @@ class LNLN(nn.Module):
         h_1_a = self.proj_a(audio_m)[:, :8]
         h_1_l = self.proj_l(self.bertmodel(language_m))[:, :8]
         
-        # 新增：噪声自适应抑制处理
+        # 噪声自适应抑制处理（先降噪，再做跨模态交互）
         h_1_l, h_1_a, h_1_v = self.nas(h_1_l, h_1_a, h_1_v)
 
         feat_tmp = self.completeness_check[0](h_1_l)[:, :1].squeeze()
@@ -149,21 +143,22 @@ class LNLN(nn.Module):
         h_hyper = repeat(self.h_hyper, '1 n d -> b n d', b = b)
         h_d_list = self.dmml[0](h_1_d)
         h_hyper = self.dmml[1](h_d_list, h_1_a, h_1_v, h_hyper)
-        feat = self.dmml[2](h_hyper, h_d_list[-1])
-        # Two ways to get the cls_output: using extra cls_token or using mean of all the features
-        # output = self.dmml[3](feat[:, 0]) 
+        
+        # 调用修复后的动态跨模态交互模块
+        feat = self.dmml[2](h_hyper, h_d_list[-1], h_1_l, h_1_a, h_1_v)
+        
+        # 情感预测输出
         output = self.dmml[3](torch.mean(feat[:, 1:], dim=1))
 
         rec_feats, complete_feats, effectiveness_discriminator_out = None, None, None
         if (vision is not None) and (audio is not None) and (language is not None):
-            # Reconstruction
-            # for layer in self.reconstructor:
+            # 重构分支
             rec_feat_a = self.reconstructor[0](h_1_a)
             rec_feat_v = self.reconstructor[1](h_1_v)
             rec_feat_l = self.reconstructor[2](h_1_l)
             rec_feats = torch.cat([rec_feat_a, rec_feat_v, rec_feat_l], dim=1)
 
-            # Compute the complete features as the label of reconstruction
+            # 计算完整特征作为重构标签
             complete_language_feat = self.proj_l(self.bertmodel(language))[:, :8]
             complete_vision_feat = self.proj_v(vision)[:, :8]
             complete_audio_feat = self.proj_a(audio)[:, :8]
@@ -171,8 +166,7 @@ class LNLN(nn.Module):
             effective_discriminator_input = rearrange(torch.cat([h_1_d, complete_language_feat]), 'b n d -> (b n) d')
             effectiveness_discriminator_out = self.effective_discriminator(effective_discriminator_input)
         
-            complete_feats = torch.cat([complete_audio_feat, complete_vision_feat, complete_language_feat], dim=1) # as the label of reconstruction
-  
+            complete_feats = torch.cat([complete_audio_feat, complete_vision_feat, complete_language_feat], dim=1)
 
         return {'sentiment_preds': output, 
                 'w': w, 
